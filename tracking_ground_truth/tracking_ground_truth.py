@@ -11,9 +11,12 @@ from geometry_msgs.msg import Point, Quaternion
 from msg_ros.msg import BoundingBoxArray, BoundingBox
 import tf_transformations as tf
 from geometry_msgs.msg import Transform
+import os
+
 
 import struct
 import std_msgs.msg as std_msgs
+import json
 
 
 
@@ -167,8 +170,21 @@ def convert_WGS84_To_UTM(lat1, long1):  # coordinates conversions
     Y = mu * phi * (1 + omega) + Bo
     return X, Y
 
+def convert_bbox_to_dict(bbox):
+    return {
+        "centroid":     [bbox.centroid.x, bbox.centroid.y, bbox.centroid.z],
+        "dimension":    [bbox.dimension.x, bbox.dimension.y, bbox.dimension.z],
+        "orientation":  [bbox.orientation.x, bbox.orientation.y, bbox.orientation.z, bbox.orientation.w],
+        "velocity":     [bbox.velocity.linear.x, bbox.velocity.linear.y, bbox.velocity.linear.z],
+        "id":           bbox.tracking_id
+        }
+
+def convert_bboxes_to_list(bboxes: list):
+    return [convert_bbox_to_dict(box) for box in bboxes]
+
 # from stack_interfaces.msg import GnssOdom, BoundingBox, BoundingBoxArray
 import utm
+
 def homogeneous_inverse(hom_matrix):
     inv_rot = np.linalg.inv(hom_matrix[:3, :3])
     inv_translation = -inv_rot@np.array(hom_matrix[:3, 3])
@@ -182,6 +198,9 @@ class TrackingGT(Node):
     def __init__(self):
         super().__init__('tracking_gt')
         self.declare_parameter("only_gt", True)
+        self.declare_parameter("store_data", False)
+
+
         self.target_frame = "map"
         self.ref_lat = 52.55754329939843
         self.ref_long = 13.281288759978164
@@ -196,6 +215,19 @@ class TrackingGT(Node):
         ego_gps_location_subscriber = message_filters.Subscriber(self, GnssOdom, "/localization/filtered_output")
         object_location_subscirber = message_filters.Subscriber(self, NavSatFix, "/perception/eqv/gnss")
         bboxes_subscriber = message_filters.Subscriber(self, BoundingBoxArray, "/perception/tracking/bboxes")
+        self.store_data = self.get_parameter('store_data').get_parameter_value().bool_value
+        
+        # check/create folder for storing data
+        if self.store_data:
+            store_dir = os.path.join(os.path.expanduser('~'), "tracking_ground_truth_files")
+            self.store_path = os.path.join(store_dir, 'radar_mot_gt_scenario_1.json')
+            self.get_logger().info(f"files will be written to {self.store_path}")
+            os.makedirs(store_dir, exist_ok=True)
+            with open(self.store_path, 'w') as file:
+                format = {"ground_truth": [], "predictions":[]}
+                json.dump(format, file, indent=4)
+
+
         only_gt = self.get_parameter('only_gt').get_parameter_value().bool_value
         if (only_gt):
             print("tracking ground truth initialized. Visualize only groundtruth.")
@@ -289,6 +321,9 @@ class TrackingGT(Node):
         obj_x_ref, obj_y_ref = obj_x_abs - self.ref_x, obj_y_abs - self.ref_y
         return obj_x_ref, obj_y_ref
 
+
+
+
     def only_gt_callback(self, ego_gps_location, object_status):
         obj_x_ref, obj_y_ref = self.get_object_x_y(object_status)
         # object's coordinates relative to ego
@@ -310,6 +345,20 @@ class TrackingGT(Node):
         gt_bboxes = self.create_gt_bboxes(obj_pos, obj_heading)
         gt_bboxes.header.frame_id = ego_gps_location.header.frame_id
         gt_bboxes.header.stamp = ego_gps_location.header.stamp
+        if (self.store_data):
+            file =  open(self.store_path, 'r')
+            data = json.load(file)
+            file.close()
+            data["predictions"].append(convert_bboxes_to_list(pred_bboxes.bounding_boxes))
+            data["ground_truth"].append(convert_bboxes_to_list(gt_bboxes.bounding_boxes))
+            file = open(self.store_path, 'w')
+            json.dump(data, file, indent=2)
+            file.close()
+            
+
+
+
+
         self.gt_bboxes_publisher_.publish(gt_bboxes)
         self.pred_bboxes_publisher_.publish(pred_bboxes)
 
