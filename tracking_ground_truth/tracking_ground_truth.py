@@ -167,7 +167,6 @@ def convert_WGS84_To_UTM(lat1, long1):  # coordinates conversions
     Y = mu * phi * (1 + omega) + Bo
     return X, Y
 
-
 # from stack_interfaces.msg import GnssOdom, BoundingBox, BoundingBoxArray
 import utm
 def homogeneous_inverse(hom_matrix):
@@ -182,6 +181,7 @@ def homogeneous_inverse(hom_matrix):
 class TrackingGT(Node):
     def __init__(self):
         super().__init__('tracking_gt')
+        self.declare_parameter("only_gt", True)
         self.target_frame = "map"
         self.ref_lat = 52.55754329939843
         self.ref_long = 13.281288759978164
@@ -193,100 +193,81 @@ class TrackingGT(Node):
         self.gt_bboxes_publisher_  = self.create_publisher(BoundingBoxArray, '/perception/tracking/gt_bboxes', 10)
         self.pred_bboxes_publisher_  = self.create_publisher(BoundingBoxArray, '/perception/tracking/pred_bboxes', 10)
 
-
         ego_gps_location_subscriber = message_filters.Subscriber(self, GnssOdom, "/localization/filtered_output")
         object_location_subscirber = message_filters.Subscriber(self, NavSatFix, "/perception/eqv/gnss")
         bboxes_subscriber = message_filters.Subscriber(self, BoundingBoxArray, "/perception/tracking/bboxes")
-
-        
-        # ts = message_filters.ApproximateTimeSynchronizer([ego_gps_location_subscriber, object_location_subscirber, bboxes_subscriber], 200, 0.1)
-        ts = message_filters.ApproximateTimeSynchronizer([ego_gps_location_subscriber, object_location_subscirber], 200, 0.1)
-        ts.registerCallback(self.transform_callback)
-        print("tracking ground truth initialized.")
+        only_gt = self.get_parameter('only_gt').get_parameter_value().bool_value
+        if (only_gt):
+            print("tracking ground truth initialized. Visualize only groundtruth.")
+            ts = message_filters.ApproximateTimeSynchronizer([ego_gps_location_subscriber, object_location_subscirber], 200, 0.1)
+            ts.registerCallback(self.only_gt_callback)
+        else:
+            print("tracking ground truth initialized. Visualize groundtruth and predictions.")
+            ts = message_filters.ApproximateTimeSynchronizer([ego_gps_location_subscriber, object_location_subscirber, bboxes_subscriber], 200, 0.1)
+            ts.registerCallback(self.callback)
         self.prev_x = 0
         self.prev_y = 0
         self.first = True
-
-    def transform_callback(self, ego_gps_location, object_status):
-        # object's absolute coordinates
-        obj_x_abs, obj_y_abs = convert_WGS84_To_UTM(object_status.latitude, object_status.longitude)
-        # object's coordinates relative to reference point
-        obj_x_ref, obj_y_ref = obj_x_abs - self.ref_x, obj_y_abs - self.ref_y
-
+    
+    def get_object_rel_position_and_heading(self, ego_gps_pose, object_position):
+        obj_x, obj_y = object_position
         # object's velocity in reference coordinates (assuming yaw = velocit direction)
-        vx = obj_x_ref - self.prev_x
-        vy = obj_y_ref - self.prev_y
-        self.prev_x = obj_x_ref
-        self.prev_y = obj_y_ref
+        vx = obj_x - self.prev_x
+        vy = obj_y - self.prev_y
+        self.prev_x = obj_x
+        self.prev_y = obj_y
         if self.first:
             ref_obj_yaw = 0
             self.first = False
         else:
             ref_obj_yaw = math.atan2(vy, vx)
-        # ref_obj_yaw = 0
-
         # ref->obj 
         ref_obj_t = tf.euler_matrix(0, 0, ref_obj_yaw)
-        ref_obj_t[:, 3] = [obj_x_ref, obj_y_ref, 0, 1]
+        ref_obj_t[:, 3] = [obj_x, obj_y, 0, 1]
 
         # ref->gps 
-        gps_pos =  ego_gps_location.filtered_odometry.pose.pose.position
-        gps_orientation = ego_gps_location.filtered_odometry.pose.pose.orientation
+        gps_pos =  ego_gps_pose.position
+        gps_orientation = ego_gps_pose.orientation
         ref_gps_t = tf.quaternion_matrix([gps_orientation.x, gps_orientation.y, gps_orientation.z, gps_orientation.w])
         ref_gps_t[:, 3] = [gps_pos.x, gps_pos.y, gps_pos.z, 1]
         ref_gps_rpy = tf.euler_from_quaternion([gps_orientation.x, gps_orientation.y, gps_orientation.z,gps_orientation.w])
 
-        # gps->ref 
-        gps_ref_t = homogeneous_inverse(ref_gps_t)
-
         # gps->top_lidar 
         gps_lidar_rotation = [0, 0, 0, 1] #7071068, 0.7071068]
-        gps_lidar_translation = [1.7, 0, 0, 1] # homogeneous
+        gps_lidar_translation = [2.2, 0, 0, 1] # homogeneous
         gps_lidar_t = tf.quaternion_matrix(gps_lidar_rotation)
         gps_lidar_t[:, 3] = gps_lidar_translation
 
-        # lidar->gps 
-        lidar_gps_t = homogeneous_inverse(gps_lidar_t)
-        gps_obj_t = gps_ref_t@ref_obj_t
-
         # get lidar->obj transform
-        lidar_obj_t = lidar_gps_t@gps_obj_t
+        lidar_obj_t = homogeneous_inverse((ref_gps_t@gps_lidar_t))@ref_obj_t
 
         obj_rel_position = tf.translation_from_matrix(lidar_obj_t)
         obj_rel_orientation_rpy = tf.euler_from_matrix(lidar_obj_t)
-        obj_x_rel = obj_rel_position[0]
-        obj_y_rel = obj_rel_position[1]
-        # ego_obj_t = ego_ref_t * ref_obj_t
-        # ego_obj_rpy = tf.euler_from_matrix(ego_obj_t)
 
         ego_yaw = ref_gps_rpy[2]
-        print(f"ego rpy {ref_gps_rpy}")
-        print(f"ego yaw degrees:  {np.degrees(ego_yaw)}")
-        print(f"obj yaw rel to ref: {np.degrees(ref_obj_yaw)}")
-        print(f"obj yaw rel to ego: {np.degrees(obj_rel_orientation_rpy[2])}")
+        self.get_logger().debug(f"ego rpy {ref_gps_rpy}")
+        self.get_logger().debug(f"ego yaw degrees:  {np.degrees(ego_yaw)}")
+        self.get_logger().debug(f"obj yaw rel to ref: {np.degrees(ref_obj_yaw)}")
+        self.get_logger().debug(f"obj yaw rel to ego: {np.degrees(obj_rel_orientation_rpy[2])}")
+        self.get_logger().debug(f"object's location: ({obj_rel_position[0]}, {obj_rel_position[1]}")
+        return obj_rel_position[:2], obj_rel_orientation_rpy[2]
 
-        
-        # obj_x_abs, obj_y_abs, _, _ = utm.from_latlon(object_status.latitude, object_status.longitude)
-        # obj_x_rel, obj_y_rel = obj_x_ref-ego_x, obj_y_ref-ego_y
-
-        # dist = math.sqrt((obj_x_rel)**2+(obj_y_rel)**2)
-
-        cloud = point_cloud(np.array([[obj_x_rel, obj_y_rel, 0]]), "base_link", "xyz")
+    def create_gt_bboxes(self, object_pos, object_heading):
+        obj_x, obj_y = object_pos
         gt_bboxes = BoundingBoxArray()
         bbox = BoundingBox()
         centroid = Point()
         dimension = Point()
         orientation = Quaternion()
 
-        centroid.x = obj_x_rel
-        centroid.y = obj_y_rel
+        centroid.x = obj_x
+        centroid.y = obj_y
         centroid.z = -1.
         dimension.x = 4.
         dimension.y = 2.
         dimension.z = 2.
 
-        # orientation_tf = tf.quaternion_from_matrix(lidar_obj_t) # # obj_rel_orientation_rpy[0]) #+np.deg2rad(90))
-        orientation_tf =  tf.quaternion_from_euler(0,0, obj_rel_orientation_rpy[2]+np.deg2rad(90))
+        orientation_tf =  tf.quaternion_from_euler(0,0, object_heading+np.deg2rad(90))
         orientation.x = orientation_tf[0]
         orientation.y = orientation_tf[1]
         orientation.z = orientation_tf[2]
@@ -298,13 +279,39 @@ class TrackingGT(Node):
         bbox.tracking_id = -1
         
         gt_bboxes.bounding_boxes.append(bbox)
+
+        return gt_bboxes
+
+    def get_object_x_y(self, object_status):
+        # object's absolute coordinates
+        obj_x_abs, obj_y_abs = convert_WGS84_To_UTM(object_status.latitude, object_status.longitude)
+        # object's coordinates relative to reference point
+        obj_x_ref, obj_y_ref = obj_x_abs - self.ref_x, obj_y_abs - self.ref_y
+        return obj_x_ref, obj_y_ref
+
+    def only_gt_callback(self, ego_gps_location, object_status):
+        obj_x_ref, obj_y_ref = self.get_object_x_y(object_status)
+        # object's coordinates relative to ego
+        obj_pos, obj_heading = self.get_object_rel_position_and_heading(ego_gps_location.filtered_odometry.pose.pose, [obj_x_ref, obj_y_ref])
+        # create bbox from position and orientation
+        gt_bboxes = self.create_gt_bboxes(obj_pos, obj_heading)
         gt_bboxes.header.frame_id = ego_gps_location.header.frame_id
         gt_bboxes.header.stamp = ego_gps_location.header.stamp
-
-        print(f"object's location: ({obj_x_rel}, {obj_y_rel}")
         self.gt_bboxes_publisher_.publish(gt_bboxes)
-        # self.pred_bboxes_publisher_.publish(pred_bboxes)
+        cloud = point_cloud(np.array([[obj_pos[0], obj_pos[1], 0]]), "base_link", "xyz")
         self.object_1_pc_publisher_.publish(cloud)
+
+    def callback(self, ego_gps_location, object_status, pred_bboxes):
+        print("got bboxes.")
+        obj_x_ref, obj_y_ref = self.get_object_x_y(object_status)
+        # object's coordinates relative to ego
+        obj_pos, obj_heading = self.get_object_rel_position_and_heading(ego_gps_location.filtered_odometry.pose.pose, [obj_x_ref, obj_y_ref])
+        # create bbox from position and orientation
+        gt_bboxes = self.create_gt_bboxes(obj_pos, obj_heading)
+        gt_bboxes.header.frame_id = ego_gps_location.header.frame_id
+        gt_bboxes.header.stamp = ego_gps_location.header.stamp
+        self.gt_bboxes_publisher_.publish(gt_bboxes)
+        self.pred_bboxes_publisher_.publish(pred_bboxes)
 
 
 def main(args=None):

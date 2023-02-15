@@ -10,5 +10,6 @@ def generate_launch_description():
             name="tracking_gt_node",
             output="screen",
             emulate_tty=True,
+            parameters= [{"only_gt": False}]
         )
     ])
